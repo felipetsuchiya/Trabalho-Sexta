@@ -1,7 +1,7 @@
-const authService = require("../services/authService"); // Assuming this might contain verificaAutenticacao or similar
-const { createClient } = require("redis");
+const amqp = require("amqplib");
 const axios = require("axios");
 
+// Função de verificação de autenticação
 async function verificaAutenticacao(token, userId) {
   try {
     const response = await axios.get("http://localhost:8000/token", {
@@ -15,119 +15,121 @@ async function verificaAutenticacao(token, userId) {
   }
 }
 
+// Envia mensagem para a fila (RabbitMQ)
 async function sendMessage(req, res) {
   const token = req.headers.authorization;
   const { userIdSend, userIdReceive, message } = req.body;
-  console.log(token)
+
   const authResult = await verificaAutenticacao(token, userIdSend);
   if (!authResult) {
     return res.status(401).json({ msg: "not auth" });
   }
 
-  const queueKey = `${userIdSend}${userIdReceive}`;
-
-  const redisClient = createClient({ url: "redis://localhost:6379" });
-  redisClient.on("error", (err) => console.error("Redis error", err));
+  const queueName = `${userIdSend}${userIdReceive}`;
 
   try {
-    await redisClient.connect();
+    const conn = await amqp.connect("amqp://localhost");
+    const channel = await conn.createChannel();
+    await channel.assertQueue(queueName, { durable: true });
+
     const msgObj = {
       message,
       userIdSend,
       userIdReceive,
     };
 
-    await redisClient.lPush(queueKey, JSON.stringify(msgObj));
-    await redisClient.quit();
+    channel.sendToQueue(queueName, Buffer.from(JSON.stringify(msgObj)), {
+      persistent: true,
+    });
 
-    console.log(msgObj.auth);
-    return res.json({ msg: "Mensagem adicionada na fila com sucesso" });
+    await channel.close();
+    await conn.close();
+
+    return res.json({ msg: `Mensagem enviada para a fila, ${queueName}` });
   } catch (err) {
-    console.error("Erro ao adicionar mensagem na fila:", err);
-    return res.status(500).json({ msg: "Erro interno ao adicionar mensagem" });
+    console.error("Erro ao enviar mensagem para RabbitMQ:", err);
+    return res.status(500).json({ msg: "Erro interno ao enviar mensagem" });
   }
 }
 
+// Processa mensagens da fila (RabbitMQ)
 async function processMessages(req, res) {
-  const redisClient = createClient({ url: "redis://localhost:6379" });
-  redisClient.on("error", (err) => console.error("Redis error", err));
+  const token = req.headers.authorization;
+  const { userIdSend, userIdReceive } = req.body;
+
+  if (!token || !userIdSend || !userIdReceive) {
+    return res.status(400).json({ msg: "Parâmetros inválidos" });
+  }
+
+  const authOk = await verificaAutenticacao(token, userIdSend);
+  if (!authOk) {
+    return res.status(401).json({ msg: "Usuário não autenticado" });
+  }
+
+  const queueName = `${userIdSend}${userIdReceive}`;
 
   try {
-    await redisClient.connect();
+    const conn = await amqp.connect("amqp://localhost");
+    const channel = await conn.createChannel();
+    await channel.assertQueue(queueName, { durable: true });
 
-    const token = req.headers.authorization;
-    const { userIdSend, userIdReceive } = req.body;
+    let processedMessages = 0;
 
-    if (!token || !userIdSend || !userIdReceive) {
-      await redisClient.quit();
-      return res.status(400).json({ msg: "Parâmetros inválidos" });
-    }
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(), 5000); // tempo máximo de espera
 
-    const authOk = await verificaAutenticacao(token, userIdSend);
-    if (!authOk) {
-      await redisClient.quit();
-      return res.status(401).json({ msg: "Usuário não autenticado" });
-    }
+      channel.consume(
+        queueName,
+        async (msg) => {
+          if (msg !== null) {
+            const content = JSON.parse(msg.content.toString());
 
-    const queueKey = `${userIdSend}${userIdReceive}`;
+            try {
+              await axios.post(
+                "http://localhost:5000/messages",
+                {
+                  message: content.message,
+                  userIdSend: content.userIdSend,
+                  user_id_receive: content.userIdReceive,
+                },
+                {
+                  headers: { Authorization: token },
+                }
+              );
 
-    const rawMessages = await redisClient.lRange(queueKey, 0, -1);
-
-    if (rawMessages.length === 0) {
-      await redisClient.quit();
-      return res.json({
-        msg: "Nenhuma mensagem para processar",
-        processedMessages: 0,
-      });
-    }
-
-    const messages = rawMessages.map((msgJson) => JSON.parse(msgJson));
-
-    for (const msg of messages) {
-      await axios.post(
-        "http://localhost:5000/messages",
-        {
-          message: msg.message,
-          userIdSend: msg.userIdSend,
-          user_id_receive: msg.userIdReceive,
+              channel.ack(msg);
+              processedMessages++;
+            } catch (error) {
+              console.error("Erro ao enviar mensagem para o serviço:", error);
+              channel.nack(msg);
+            }
+          }
         },
-        {
-          headers: {
-            Authorization: token,
-          },
-        }
+        { noAck: false }
       );
-    }
-    await redisClient.del(queueKey);
-    await redisClient.quit();
+    });
 
-    return res.json({ msg: "ok", processedMessages: messages.length });
+    await channel.close();
+    await conn.close();
+
+    return res.json({ msg: "ok", processedMessages });
   } catch (err) {
-    console.error("Erro no worker:", err);
-    try {
-      await redisClient.quit();
-    } catch (quitErr) {
-      console.error("Erro ao fechar conexão Redis no erro:", quitErr);
-    }
-    return res.status(500).json({ msg: "Erro interno no worker" });
+    console.error("Erro no processamento RabbitMQ:", err);
+    return res.status(500).json({ msg: "Erro interno no processamento" });
   }
 }
 
+// Busca mensagens (sem RabbitMQ)
 async function getMessages(req, res) {
   const token = req.headers.authorization;
   const { user_id_receive } = req.query;
   const { userIdSend } = req.body;
 
-  const redisClient = createClient({ url: "redis://localhost:6379" });
-  redisClient.on("error", (err) => console.error("Redis error", err));
-
-  await redisClient.connect();
-
   const authOk = await verificaAutenticacao(token, userIdSend);
   if (!authOk) {
-    await redisClient.quit();
     return res.status(401).json({ msg: "Usuário não autenticado" });
   }
+
   try {
     const messages = await axios.get("http://localhost:5000/messages", {
       headers: {
@@ -137,13 +139,16 @@ async function getMessages(req, res) {
         user_id_receive: user_id_receive,
       },
     });
-    if (!messages || messages.length === 0) {
+
+    if (!messages || messages.data.messages.length === 0) {
       return res
         .status(404)
         .json({ error: "Nenhuma mensagem encontrada entre esses usuários." });
     }
+
     const txt = messages.data.messages[0][1];
     const userId = messages.data.messages[0][2];
+
     return res.status(200).json({
       userId: userId,
       msg: txt,
